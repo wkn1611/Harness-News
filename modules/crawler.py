@@ -72,13 +72,9 @@ class NewsCrawler:
         """
         logger.debug(f"Fetching URL: {url}")
         
-        # User-Agent header helps avoid basic bot mitigation blocks
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
-        }
-        
-        # Adding a generous timeout to accommodate slow target servers
-        response = await client.get(url, headers=headers, follow_redirects=True, timeout=15.0)
+        # We rely entirely on the AsyncClient's global configuration
+        # for realistic headers, redirects, and timeouts.
+        response = await client.get(url)
         
         # Raise an exception for HTTP error statuses (triggers the tenacity retry)
         response.raise_for_status()
@@ -166,15 +162,24 @@ class NewsCrawler:
             logger.error(f"Failed to completely extract {link}: {e.__class__.__name__} - {e}")
             return None
 
-    async def crawl(self) -> List[Article]:
+    async def crawl(self, limit: Optional[int] = None) -> List[Article]:
         """
         Main orchestrator. Loads feeds, extracts entry links, limits concurrent
         article scraping, and finally returns a list of valid Article objects.
         """
         valid_articles = []
         
+        # Configure the global client with realistic modern browser headers
+        # to bypass basic bot mitigation across all requests.
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Upgrade-Insecure-Requests": "1"
+        }
+        
         # Centralizing requests into an AsyncClient leverages connection pooling
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15.0) as client:
             
             # Step 1: Concurrently grab all RSS feeds
             feed_tasks = [self._fetch_and_parse_feed(client, url) for url in self.urls]
@@ -187,6 +192,8 @@ class NewsCrawler:
                     all_entries.extend(result)
             
             logger.info(f"Discovered {len(all_entries)} potential articles from RSS feeds.")
+            if limit:
+                all_entries = all_entries[:limit]
             
             # Step 2: Concurrently scrape article HTML, but tightly bounded!
             # A Semaphore prevents flooding the network or overloading Raspberry Pi's RAM
