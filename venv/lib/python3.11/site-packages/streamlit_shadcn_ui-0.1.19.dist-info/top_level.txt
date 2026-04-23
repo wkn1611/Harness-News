@@ -1,0 +1,5 @@
+docs
+e2e
+local_components
+pages
+streamlit_shadcn_ui
