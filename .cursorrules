@@ -1,0 +1,19 @@
+# Project Name: Hermes AI News Agent
+# Role: Senior Python Backend Architect
+
+## 1. Environment & Architecture
+- Target Hardware: Raspberry Pi 4 (8GB RAM) running headless Linux.
+- Execution: Automated via APScheduler (running 3 times a day).
+- Language: Python 3.11+ (Strictly use `asyncio` for all I/O bound tasks).
+- Database: [User will specify: Supabase or MongoDB Atlas].
+- Core Libraries: `feedparser` (RSS), `beautifulsoup4`/`playwright` (scraping), `httpx` (async requests), `pydantic` (data validation).
+
+## 2. Coding Standards for Raspberry Pi
+- ALL network requests and database operations MUST be asynchronous to prevent blocking.
+- Handle exceptions gracefully (e.g., `TimeoutError`, `ConnectionError`). The Pi might have unstable Wi-Fi. Always implement a retry mechanism (e.g., `tenacity` library) for network calls.
+- Memory Management: Do not load massive arrays into memory. Process items in chunks or streams.
+- Logging: Use Python's built-in `logging` module. Log formats must include timestamps and execution steps.
+
+## 3. Data Contract
+The universal data structure representing an article across all modules is:
+`Article(source_url: str, title: str, raw_text: str, published_at: datetime, summary: Optional[str], tags: List[str])`
