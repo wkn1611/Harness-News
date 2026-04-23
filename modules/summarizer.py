@@ -1,34 +1,35 @@
 import os
-import logging
-import google.generativeai as genai
-from typing import Optional
+from google import genai
+from loguru import logger
 from dotenv import load_dotenv
 
 load_dotenv()
 
-logger = logging.getLogger(__name__)
-
 class ArticleSummarizer:
     """
-    Leverages Google's Gemini LLM to generate concise summaries for news articles.
+    Leverages the NEW Google GenAI SDK to generate concise summaries for news articles.
+    Optimized for stability on Raspberry Pi ARM architectures by using synchronous calls.
     """
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            logger.warning("GEMINI_API_KEY not found in environment. Summarization will be mocked.")
-            self.model = None
+            logger.error("GEMINI_API_KEY not found in environment!")
+            self.client = None
         else:
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel('gemini-1.5-flash')
-            logger.info("Summarizer Initialized with Gemini.")
+            # Initialize the NEW google-genai client
+            self.client = genai.Client(api_key=api_key)
+            self.model_id = "gemini-1.5-flash"
+            logger.info(f"ArticleSummarizer initialized with model: {self.model_id}")
 
-    async def process_article(self, raw_text: str) -> str:
+    def process_article(self, raw_text: str) -> str:
         """
-        Sends the article text to Gemini and returns a 3-sentence summary.
+        Sends the article text to Gemini and returns a 3-bullet point summary in Vietnamese.
+        This execution is SYNCHRONOUS for maximum stability on low-resource environments.
         """
-        if not self.model:
-            return "Summary unavailable (no API key)."
+        if not self.client:
+            raise ValueError("Summarizer client not initialized (missing API key).")
 
+        # Keeping the exact high-quality "Senior Tech Journalist" prompt
         prompt = (
             "You are a Senior Tech Journalist. Your task is to summarize the following tech/AI news article "
             "into exactly 3 concise and impactful bullet points in Vietnamese. "
@@ -41,17 +42,19 @@ class ArticleSummarizer:
             "4. FORMAT: Output only the 3 bullet points, nothing else.\n\n"
             f"ARTICLE TEXT:\n{raw_text[:7000]}"
         )
-        
-        try:
-            response = await generate_content_async(self.model, prompt)
-            if not response or not response.text:
-                raise ValueError("LLM returned an empty response")
-            return response.text
-        except Exception as e:
-            logger.error(f"LLM Summarization error: {e}")
-            raise e
 
-async def generate_content_async(model, prompt):
-    """Utility to run the generative AI call asynchronously."""
-    # The SDK actually supports async directly in newer versions
-    return await model.generate_content_async(prompt)
+        try:
+            # Using the SYNCHRONOUS generation method as requested
+            response = self.client.models.generate_content(
+                model=self.model_id,
+                contents=prompt
+            )
+
+            if not response or not response.text:
+                raise ValueError("Gemini returned an empty or invalid response.")
+
+            return response.text.strip()
+
+        except Exception as e:
+            logger.error(f"Failed to generate summary for article: {e}")
+            raise e

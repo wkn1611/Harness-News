@@ -62,7 +62,7 @@ async def run_agent_cycle():
             
             try:
                 # AI Summarization with strict verification
-                summary = await summarizer.process_article(article.raw_text)
+                summary = summarizer.process_article(article.raw_text)
                 
                 # Check for empty or very short failure-state summaries
                 if not summary or len(summary) < 10:
