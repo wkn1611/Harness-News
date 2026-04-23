@@ -29,7 +29,18 @@ class ArticleSummarizer:
         if not self.model:
             return "Summary unavailable (no API key)."
 
-        prompt = f"Summarize the following tech/AI news article in exactly 3 concise bullet points:\n\n{raw_text[:5000]}"
+        prompt = (
+            "You are a Senior Tech Journalist. Your task is to summarize the following tech/AI news article "
+            "into exactly 3 concise and impactful bullet points in Vietnamese. "
+            "\n\nSTRICT RULES:\n"
+            "1. LANGUAGE: Use professional, natural, and modern Vietnamese tech-journalism tone.\n"
+            "2. TECHNICAL TERMS: Do NOT translate specialized technical terms. Keep the following words "
+            "EXACTLY as they are in English: LLM, API, Framework, Prompt, Agent, RAG, Open-source, "
+            "Machine Learning, Deep Learning, Cloud, Hardware, Software, Backend, Frontend.\n"
+            "3. ACCURACY: The meaning must perfectly match the English context without ANY hallucinations.\n"
+            "4. FORMAT: Output only the 3 bullet points, nothing else.\n\n"
+            f"ARTICLE TEXT:\n{raw_text[:7000]}"
+        )
         
         try:
             response = await generate_content_async(self.model, prompt)
