@@ -7,29 +7,67 @@ load_dotenv()
 
 class ArticleSummarizer:
     """
-    Leverages the NEW Google GenAI SDK to generate concise summaries for news articles.
-    Optimized for stability on Raspberry Pi ARM architectures by using synchronous calls.
+    Leverages the google-genai SDK to generate concise Vietnamese summaries.
+    Uses a Dynamic Model Selector to avoid 404 errors from deprecated/unavailable models.
+    Optimized for stability on Raspberry Pi ARM architectures via synchronous calls.
     """
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             logger.error("GEMINI_API_KEY not found in environment!")
             self.client = None
-        else:
-            # Initialize the NEW google-genai client
-            self.client = genai.Client(api_key=api_key)
-            self.model_id = "gemini-1.5-flash"
-            logger.info(f"ArticleSummarizer initialized with model: {self.model_id}")
+            self.model_name = None
+            return
+
+        # Initialize the client with no hardcoded http_options
+        # so the SDK resolves the optimal default API version automatically
+        self.client = genai.Client(api_key=api_key)
+        self.model_name = self._select_model()
+
+    def _select_model(self) -> str:
+        """
+        Dynamically queries available Gemini models and selects the best one.
+        Priority: first 'flash' model > first valid model with generateContent support.
+        """
+        try:
+            available_models = list(self.client.models.list())
+
+            # Filter only models that support content generation
+            generative_models = [
+                m for m in available_models
+                if hasattr(m, 'supported_generation_methods')
+                and 'generateContent' in m.supported_generation_methods
+            ]
+
+            if not generative_models:
+                raise RuntimeError("No generative models are available from the API.")
+
+            # Priority 1: first model with 'flash' in name (speed + cost optimized)
+            flash_model = next(
+                (m for m in generative_models if 'flash' in m.name.lower()),
+                None
+            )
+
+            # Priority 2: fallback to first valid model
+            selected = flash_model if flash_model else generative_models[0]
+
+            logger.info(f"Dynamically selected model: {selected.name}")
+            return selected.name
+
+        except Exception as e:
+            logger.error(f"Failed to fetch model list, using hardcoded fallback: {e}")
+            # Last-resort hardcoded fallback
+            return "models/gemini-1.5-flash"
 
     def process_article(self, raw_text: str) -> str:
         """
         Sends the article text to Gemini and returns a 3-bullet point summary in Vietnamese.
-        This execution is SYNCHRONOUS for maximum stability on low-resource environments.
+        Execution is SYNCHRONOUS for maximum stability on low-resource environments.
         """
-        if not self.client:
-            raise ValueError("Summarizer client not initialized (missing API key).")
+        if not self.client or not self.model_name:
+            raise ValueError("Summarizer client not initialized (missing API key or no available models).")
 
-        # Keeping the exact high-quality "Senior Tech Journalist" prompt
+        # Preserving the exact "Senior Tech Journalist" system prompt
         prompt = (
             "You are a Senior Tech Journalist. Your task is to summarize the following tech/AI news article "
             "into exactly 3 concise and impactful bullet points in Vietnamese. "
@@ -44,9 +82,8 @@ class ArticleSummarizer:
         )
 
         try:
-            # Using the SYNCHRONOUS generation method as requested
             response = self.client.models.generate_content(
-                model=self.model_id,
+                model=self.model_name,
                 contents=prompt
             )
 
@@ -56,5 +93,5 @@ class ArticleSummarizer:
             return response.text.strip()
 
         except Exception as e:
-            logger.error(f"Failed to generate summary for article: {e}")
+            logger.error(f"Failed to generate summary using model '{self.model_name}': {e}")
             raise e
