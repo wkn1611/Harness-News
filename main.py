@@ -9,9 +9,11 @@ from rich.logging import RichHandler
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 # Internal imports
+import json
 from modules.crawler import NewsCrawler
 from modules.summarizer import ArticleSummarizer
 from modules.database import NewsDatabase
+from models.article import TechRadarAnalysis
 
 # Configure Rich Logging
 console = Console()
@@ -61,20 +63,28 @@ async def run_agent_cycle():
             logger.info(f"[yellow]Processing new article:[/yellow] {article.title}")
             
             try:
-                # AI Summarization with strict verification
-                summary = summarizer.process_article(article.raw_text)
-                
-                # Check for empty or very short failure-state summaries
-                if not summary or len(summary) < 10:
-                    logger.warning(f"[yellow]Summary generation failed or empty for:[/yellow] {article.title}")
+                # Tech Radar analysis — returns a validated structured dict
+                analysis_dict = summarizer.process_article(article.raw_text)
+
+                # Validate the required fields are present before persisting
+                if not analysis_dict.get('tl_dr') or not analysis_dict.get('category'):
+                    logger.warning(f"[yellow]Analysis incomplete or missing fields for:[/yellow] {article.title}")
                     continue
-                
-                article.summary = summary
-                
-                # Final storage - ONLY if summarization was successful and verified
+
+                # Hydrate the structured Pydantic model from the LLM dict
+                article.analysis = TechRadarAnalysis(**analysis_dict)
+
+                # Final storage - ONLY if analysis was successfully structured
                 await db.save_article(article)
                 new_articles_count += 1
-                
+                logger.info(
+                    f"[green]Saved:[/green] [{article.analysis.category}] "
+                    f"(score: {article.analysis.relevance_score}) {article.title}"
+                )
+
+            except json.JSONDecodeError:
+                logger.error(f"[red]LLM returned invalid JSON for:[/red] '{article.title}' — skipping.")
+                continue
             except Exception as e:
                 logger.error(f"[red]Failed to process article '{article.title}': {e}[/red]")
                 continue
