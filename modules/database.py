@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 _client = None
 
 def get_db():
-    """Returns the 'news_radar' database instance, lazily connecting if needed."""
+    """Returns the configured database instance, lazily connecting if needed."""
     global _client
     if _client is None:
         uri = os.environ.get("MONGODB_URI")
@@ -26,7 +26,9 @@ def get_db():
             logger.error("MONGODB_URI not found in environment variables!")
             raise ValueError("MONGODB_URI is required.")
         _client = MongoClient(uri)
-    return _client.news_radar
+    
+    db_name = os.getenv("DB_NAME", "hermes_news")
+    return _client[db_name]
 
 def setup_database():
     """
