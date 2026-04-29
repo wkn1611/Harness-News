@@ -5,8 +5,8 @@ Uses a Primary-Fallback multi-provider LLM pipeline (Cerebras + OpenRouter)
 to analyze raw article markdown and extract structured JSON intelligence reports.
 
 Fallback logic:
-    1. Primary:  Cerebras (llama3.1-70b)
-    2. Fallback: OpenRouter (meta-llama/llama-3-8b-instruct:free)
+    1. Primary:  Cerebras (llama-3.3-70b)
+    2. Fallback: OpenRouter (meta-llama/llama-3.3-70b-instruct:free)
 """
 import json
 import os
@@ -22,8 +22,8 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Provider & Model Configuration
 # ---------------------------------------------------------------------------
-PRIMARY_MODEL = "llama3.1-70b"
-FALLBACK_MODEL = "meta-llama/llama-3-8b-instruct:free"
+PRIMARY_MODEL = "llama-3.3-70b"
+FALLBACK_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 
 MAX_CONTEXT_CHARS = 25_000
 
