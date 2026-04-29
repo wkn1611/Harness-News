@@ -5,12 +5,13 @@ Uses a Primary-Fallback multi-provider LLM pipeline (Cerebras + OpenRouter)
 to analyze raw article markdown and extract structured JSON intelligence reports.
 
 Fallback logic:
-    1. Primary:  Cerebras (llama-3.3-70b)
+    1. Primary:  Cerebras (llama3.1-8b)
     2. Fallback: OpenRouter (meta-llama/llama-3.3-70b-instruct:free)
 """
 import json
 import os
 import re
+import time
 from typing import Optional
 
 from openai import OpenAI
@@ -22,7 +23,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Provider & Model Configuration
 # ---------------------------------------------------------------------------
-PRIMARY_MODEL = "llama-3.3-70b"
+PRIMARY_MODEL = "llama3.1-8b"
 FALLBACK_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 
 MAX_CONTEXT_CHARS = 25_000
@@ -116,7 +117,8 @@ def analyze_article(markdown_text: str) -> Optional[dict]:
         try:
             return _call_llm(client_primary, PRIMARY_MODEL, truncated_text)
         except Exception as e:
-            logger.warning(f"Primary model ({PRIMARY_MODEL}) failed: {e}. Falling back to OpenRouter...")
+            logger.warning(f"Primary model ({PRIMARY_MODEL}) failed: {e}. Sleeping 10s to respect OpenRouter rate limits before fallback...")
+            time.sleep(10)
     else:
         logger.warning("Skipping Primary model (Cerebras) because API key is missing. Trying Fallback...")
 
