@@ -6,6 +6,9 @@ Orchestrates the 3-Tier architecture:
 - Tier 2: Intelligence Engine (Groq LLM)
 - Tier 3: The Vault (MongoDB Atlas)
 """
+import os
+from dotenv import load_dotenv
+load_dotenv()
 import logging
 from datetime import datetime
 from rich.console import Console
