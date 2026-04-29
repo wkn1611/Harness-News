@@ -1,0 +1,17 @@
+[
+  {
+    "url": "https://huggingface.co/papers.rss",
+    "category_tag": "AI Research",
+    "type": "rss"
+  },
+  {
+    "url": "https://hnrss.org/newest?q=Next.js+OR+Agent",
+    "category_tag": "Web & Tooling",
+    "type": "rss"
+  },
+  {
+    "url": "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day",
+    "category_tag": "Local LLMs",
+    "type": "rss"
+  }
+]

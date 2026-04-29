@@ -1,222 +1,199 @@
+"""
+Tier 2 — Intelligence Engine for the Hermes AI News Agent.
+
+Uses the Groq API (OpenAI-compatible proxy) to analyze raw article markdown
+and extract structured JSON intelligence reports using LLaMA models.
+
+Fallback logic:
+    1. Primary:  llama-3.3-70b-versatile  (deepest reasoning)
+    2. Fallback: llama-3.1-8b-instant     (fast, low-latency)
+"""
 import json
 import os
-import re
-import time
+from typing import Optional
 
-from google import genai
-from google.api_core import exceptions as google_exceptions
+from openai import OpenAI, RateLimitError
 from loguru import logger
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Model Fallback Matrix — tried in order if previous models quota-out or fail
+# Model Fallback Matrix
 # ---------------------------------------------------------------------------
-MODEL_FALLBACK_MATRIX = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-flash-lite",
-]
+PRIMARY_MODEL = "llama-3.3-70b-versatile"
+FALLBACK_MODEL = "llama-3.1-8b-instant"
 
-# Exponential backoff delays (seconds) between retries on the SAME model
-BACKOFF_SCHEDULE = [15, 30]  # Retry 1 → 15s, Retry 2 → 30s
-MAX_RETRIES_PER_MODEL = 3    # Attempts per model before cascading to the next
+# Maximum characters of markdown to send to the API.
+# Prevents context window overflow on Groq's hosted LLaMA models.
+MAX_CONTEXT_CHARS = 25_000
 
-# Rate limit pacing: 12s keeps us comfortably under the 5 req/min Free Tier
-RATE_LIMIT_SLEEP = 12
+# ---------------------------------------------------------------------------
+# System Prompt — defines the LLM's role and output schema
+# ---------------------------------------------------------------------------
+SYSTEM_PROMPT = """
+You are an elite Technical Intelligence Analyst and System Architect. 
+Your primary user is a Senior Developer building autonomous AI systems, Next.js web apps, and Edge computing solutions (e.g., Raspberry Pi).
 
-# The exact 7 Tech Radar categories (Vietnamese)
-TECH_RADAR_CATEGORIES = [
-    "Vibe Coding & Tools",
-    "Agent Infrastructure",
-    "Community Alert",
-    "Trending Repo",
-    "Local AI & Homelab",
-    "Industry Titans",
-    "Research & Benchmarks",
-]
+YOUR TASK:
+Analyze the provided technology article, news, or research paper. Extract the most high-value, actionable intelligence. 
+Ignore all marketing fluff. Focus entirely on system architectures, new frameworks, performance metrics, and practical implementations.
+
+CONSTRAINTS & RULES:
+1. NO HALLUCINATION: Only extract technologies, metrics, or insights explicitly mentioned.
+2. BE SPECIFIC: Quote exact numbers (e.g., "reduced latency by 40ms").
+3. ACTION-ORIENTED: The 'actionable_takeaway' must be a direct command the developer can execute.
+
+OUTPUT FORMAT:
+You MUST output ONLY a valid JSON object. Do not include markdown blocks like ```json. 
+Strictly adhere to this exact schema:
+{
+  "article_type": "Choose EXACTLY ONE: [News, Tool Release, Tutorial, Deep Dive]",
+  "category": "Identify the primary domain (e.g., AI & Agents, System Architecture, Open Source Tools, Security)",
+  "relevance_score": "Integer 1-10. Rate importance.",
+  "tl_dr": "A punchy, 2-sentence summary.",
+  "actionable_takeaway": "What should the developer DO next? Provide commands or steps.",
+  "tech_stack": ["Array of max 5 specific tools mentioned."],
+  "key_insights": ["Array of 3 highly technical bullet points. Include metrics/versions."],
+  "deep_dive_analysis": {
+    "architecture_design": "Explain system design (ONLY if Deep Dive, else empty)",
+    "benchmark_metrics": ["Array of performance data (ONLY if Deep Dive)"],
+    "core_limitations": "Known issues (ONLY if Deep Dive)"
+  }
+}
+""".strip()
+
+# ---------------------------------------------------------------------------
+# Groq Client Initialization
+# ---------------------------------------------------------------------------
+_groq_api_key = os.environ.get("GROQ_API_KEY")
+
+if not _groq_api_key:
+    logger.warning(
+        "GROQ_API_KEY not found in environment. "
+        "Tier 2 Intelligence Engine will be unavailable."
+    )
+    client: Optional[OpenAI] = None
+else:
+    client = OpenAI(
+        api_key=_groq_api_key,
+        base_url="https://api.groq.com/openai/v1",
+    )
+    logger.info(
+        f"Groq client initialized. "
+        f"Primary={PRIMARY_MODEL} | Fallback={FALLBACK_MODEL}"
+    )
 
 
-class ArticleSummarizer:
+# ---------------------------------------------------------------------------
+# Core Analysis Function
+# ---------------------------------------------------------------------------
+def analyze_article(markdown_text: str) -> Optional[dict]:
     """
-    Ironclad Expert Technical Analyst powered by the google-genai SDK.
+    Sends raw article markdown to the Groq API for structured intelligence
+    extraction. Returns a parsed dict matching the SYSTEM_PROMPT schema,
+    or None if all attempts fail.
 
-    Resilience features:
-    - Model Fallback Matrix: cascades through 3 models on total failure.
-    - Exponential Backoff: 15s / 30s sleeps on 429 / 503 transient errors.
-    - Strict JSON Extraction: defensive regex fence-stripping before json.loads().
-    - Rate Limit Pacing: 12s sleep after every successful API call.
+    Fallback logic:
+        1. Try PRIMARY_MODEL (llama-3.3-70b-versatile).
+        2. If RateLimitError (429) → retry with FALLBACK_MODEL.
+        3. If JSON parsing fails or any other error → return None.
+
+    Args:
+        markdown_text: Raw markdown content from the Jina Reader ingestor.
+
+    Returns:
+        A dict matching the intelligence report schema, or None on failure.
     """
+    if client is None:
+        logger.error("Groq client not initialized — cannot analyze article.")
+        return None
 
-    def __init__(self):
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            logger.error("GEMINI_API_KEY not found in environment!")
-            self.client = None
-            return
+    # Truncate to stay within the context window
+    truncated_text = markdown_text[:MAX_CONTEXT_CHARS]
 
-        # No hardcoded http_options — SDK resolves optimal API version
-        self.client = genai.Client(api_key=api_key)
-        logger.info(
-            f"ArticleSummarizer initialized. "
-            f"Model matrix: {MODEL_FALLBACK_MATRIX}"
+    # --- Attempt 1: Primary Model ---
+    try:
+        result = _call_groq(truncated_text, model=PRIMARY_MODEL)
+        return result
+
+    except RateLimitError as e:
+        logger.warning(
+            f"RateLimitError on {PRIMARY_MODEL}: {e} — "
+            f"falling back to {FALLBACK_MODEL}..."
         )
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-    def _build_prompt(self, raw_text: str) -> str:
-        """Builds the strict Tech Radar JSON extraction prompt."""
-        categories_str = "\n".join(f'  - "{c}"' for c in TECH_RADAR_CATEGORIES)
-
-        return (
-            "You are an Expert Technical Analyst building a Tech Radar for senior AI software engineers. "
-            "Your output must be a STRICTLY VALID RAW JSON object. "
-            "CRITICAL: Do NOT wrap output in markdown code blocks (no ```json). "
-            "Output ONLY the raw JSON object and absolutely nothing else.\n\n"
-
-            "ANALYZE the following article and return a JSON object with this EXACT schema:\n"
-            "{\n"
-            '  "category": "MUST be exactly ONE of the following strings:\n'
-            f"{categories_str}\",\n"
-            '  "relevance_score": <integer 1-10, rating impact for an AI software engineer>,\n'
-            '  "tl_dr": "<1-2 sentences in Vietnamese summarizing the core event>",\n'
-            '  "key_insights": [\n'
-            '    "<Insight 1: the technical WHAT — specific models, tools, version numbers>",\n'
-            '    "<Insight 2: the HOW or WHY — architecture, mechanism, methodology>",\n'
-            '    "<Insight 3: performance data, benchmarks, comparisons, or industry drama>",\n'
-            '    "<Insight 4 (optional): developer impact, migration notes, or ecosystem shift>"\n'
-            "  ],\n"
-            '  "tech_stack": ["<model/framework/library/tool name>"],\n'
-            '  "why_it_matters": "<1 sentence in Vietnamese on practical value for developers>"\n'
-            "}\n\n"
-
-            "STRICT RULES:\n"
-            "1. ALL content values (tl_dr, key_insights, why_it_matters) MUST be in Vietnamese.\n"
-            "2. NEVER translate technical English terms. Keep EXACTLY as-is: LLM, API, Framework, "
-            "Prompt, Agent, RAG, Open-source, Machine Learning, Deep Learning, Cloud, Hardware, "
-            "Software, Backend, Frontend, GPU, CUDA, fine-tuning, inference, token, embedding.\n"
-            "3. Be SPECIFIC and FACTUAL. AVOID generic filler phrases. "
-            "Always prefer version numbers, benchmark scores, and proper nouns.\n"
-            "4. relevance_score rubric: 10=paradigm shift, 7-9=major update, 4-6=noteworthy, 1-3=minor.\n\n"
-
-            f"ARTICLE TEXT:\n{raw_text[:8000]}"
+    except Exception as e:
+        logger.error(
+            f"Unexpected error on {PRIMARY_MODEL}: {e} — "
+            f"falling back to {FALLBACK_MODEL}..."
         )
 
-    @staticmethod
-    def _clean_and_parse(raw_output: str) -> dict:
-        """
-        Strips markdown code fences defensively and parses the JSON string.
-        Raises json.JSONDecodeError if the output is not valid JSON.
-        """
-        cleaned = re.sub(r'^```(?:json)?\s*', '', raw_output.strip())
-        cleaned = re.sub(r'\s*```$', '', cleaned).strip()
-        return json.loads(cleaned)
+    # --- Attempt 2: Fallback Model ---
+    try:
+        result = _call_groq(truncated_text, model=FALLBACK_MODEL)
+        return result
 
-    @staticmethod
-    def _is_transient_error(exc: Exception) -> bool:
-        """Returns True for 429 Quota and 503 Overload errors that merit a retry."""
-        error_str = str(exc).lower()
-        return (
-            "429" in error_str
-            or "quota" in error_str
-            or "resource_exhausted" in error_str
-            or "503" in error_str
-            or "overloaded" in error_str
-            or "service_unavailable" in error_str
+    except Exception as e:
+        logger.error(
+            f"Fallback model {FALLBACK_MODEL} also failed: {e} — "
+            "returning None."
         )
+        return None
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-    def process_article(self, raw_text: str) -> dict:
-        """
-        Analyzes a tech article and returns a validated Tech Radar JSON dict.
 
-        Implements a full reliability loop:
-          1. Try MODEL_FALLBACK_MATRIX[0], up to MAX_RETRIES_PER_MODEL times.
-          2. On 429 / 503 → Exponential Backoff (15s, 30s).
-          3. On total model failure → cascade to next model in matrix.
-          4. On success → sleep RATE_LIMIT_SLEEP seconds before returning.
+# ---------------------------------------------------------------------------
+# Internal API Call Helper
+# ---------------------------------------------------------------------------
+def _call_groq(text: str, model: str) -> Optional[dict]:
+    """
+    Makes a single chat completion call to the Groq API and parses the
+    JSON response.
 
-        Raises:
-            RuntimeError: if all models in the fallback matrix are exhausted.
-            json.JSONDecodeError: if the final successful response is not valid JSON.
-        """
-        if not self.client:
-            raise ValueError("Summarizer client not initialized (missing API key).")
+    Args:
+        text:  Truncated article markdown.
+        model: The Groq-hosted model identifier to use.
 
-        prompt = self._build_prompt(raw_text)
+    Returns:
+        Parsed dict from the model's JSON output.
 
-        for model_name in MODEL_FALLBACK_MATRIX:
-            attempt = 0
+    Raises:
+        RateLimitError: Propagated so the caller can trigger fallback.
+        json.JSONDecodeError: If the model returns unparseable output.
+        Exception: Any other API or network error.
+    """
+    logger.debug(f"Calling Groq | model={model} | input_chars={len(text)}")
 
-            while attempt < MAX_RETRIES_PER_MODEL:
-                attempt += 1
-                logger.debug(
-                    f"Trying model='{model_name}' attempt={attempt}/{MAX_RETRIES_PER_MODEL}"
-                )
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": text},
+        ],
+        temperature=0.2,            # Low temp for factual, deterministic output
+        response_format={"type": "json_object"},
+    )
 
-                try:
-                    response = self.client.models.generate_content(
-                        model=model_name,
-                        contents=prompt
-                    )
+    raw_output = response.choices[0].message.content
+    if not raw_output:
+        logger.error(f"Empty response from {model}.")
+        return None
 
-                    if not response or not response.text:
-                        raise ValueError("Gemini returned an empty response.")
-
-                    # --- Strict JSON Extraction ---
-                    parsed = self._clean_and_parse(response.text)
-
-                    logger.success(
-                        f"✓ Analysis complete | model='{model_name}' "
-                        f"category='{parsed.get('category')}' "
-                        f"score={parsed.get('relevance_score')}"
-                    )
-
-                    # --- Rate Limit Pacing ---
-                    # Sleep AFTER a successful call to respect the 5 RPM Free Tier
-                    logger.debug(f"Rate pacing: sleeping {RATE_LIMIT_SLEEP}s...")
-                    time.sleep(RATE_LIMIT_SLEEP)
-
-                    return parsed
-
-                except json.JSONDecodeError as e:
-                    # JSON parse failure is NOT a transient API error — don't retry
-                    logger.error(
-                        f"JSONDecodeError on model='{model_name}': {e}\n"
-                        f"Raw output preview: {response.text[:400] if response else 'N/A'}"
-                    )
-                    raise e
-
-                except Exception as e:
-                    if self._is_transient_error(e):
-                        # Apply exponential backoff from the schedule
-                        backoff_secs = BACKOFF_SCHEDULE[min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)]
-                        logger.warning(
-                            f"Transient error on model='{model_name}' attempt={attempt}: {e}\n"
-                            f"Backing off for {backoff_secs}s..."
-                        )
-                        time.sleep(backoff_secs)
-                        # Continue the while loop to retry the SAME model
-                        continue
-                    else:
-                        # Non-transient error (e.g., 404, auth failure) — don't retry this model
-                        logger.error(
-                            f"Non-transient error on model='{model_name}': {e} — skipping to next model."
-                        )
-                        break  # Break while loop, cascade to next model
-
-            # All attempts exhausted for this model
-            logger.warning(
-                f"Model '{model_name}' exhausted after {MAX_RETRIES_PER_MODEL} attempts. "
-                f"Cascading to next model in fallback matrix..."
-            )
-
-        # All models in the fallback matrix have been exhausted
-        raise RuntimeError(
-            f"All models in fallback matrix exhausted: {MODEL_FALLBACK_MATRIX}. "
-            "Cannot process article. Check API quota or connectivity."
+    # Parse the JSON — the response_format flag should guarantee valid JSON,
+    # but we still guard defensively.
+    try:
+        parsed = json.loads(raw_output)
+    except json.JSONDecodeError as e:
+        logger.error(
+            f"JSONDecodeError from {model}: {e}\n"
+            f"Raw output preview: {raw_output[:500]}"
         )
+        return None
+
+    logger.success(
+        f"✓ Analysis complete | model={model} | "
+        f"type='{parsed.get('article_type')}' | "
+        f"category='{parsed.get('category')}' | "
+        f"score={parsed.get('relevance_score')}"
+    )
+    return parsed

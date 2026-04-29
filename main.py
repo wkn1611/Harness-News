@@ -1,21 +1,20 @@
-import asyncio
-import json
-import logging
-import time
-from datetime import datetime
+"""
+Main Pipeline for the Hermes AI News Agent.
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+Orchestrates the 3-Tier architecture:
+- Tier 1: Ingestion (Jina Reader API)
+- Tier 2: Intelligence Engine (Groq LLM)
+- Tier 3: The Vault (MongoDB Atlas)
+"""
+import logging
+from datetime import datetime
 from rich.console import Console
 from rich.logging import RichHandler
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
 # Internal imports
-import json
-from modules.crawler import NewsCrawler
-from modules.summarizer import ArticleSummarizer
-from modules.database import NewsDatabase
-from modules.filter import should_process
-from models.article import TechRadarAnalysis
+from modules.ingestor import process_sources
+from modules.summarizer import analyze_article
+from modules.database import setup_database, save_article
 
 # Configure Rich Logging
 console = Console()
@@ -25,126 +24,87 @@ logging.basicConfig(
     datefmt="[%X]",
     handlers=[RichHandler(rich_tracebacks=True, console=console)]
 )
-logger = logging.getLogger("HermesAgent")
+logger = logging.getLogger("HermesPipeline")
 
-async def run_agent_cycle():
+def run_pipeline():
     """
-    The core pipeline:
-    1. Crawl RSS feeds for new articles.
-    2. Pre-filter articles with signal scoring (Pre-LLM Funnel).
-    3. Deduplicate against the database.
-    4. Analyze surviving articles with the LLM.
-    5. Save structured Tech Radar analysis to the database.
+    Executes the end-to-end news radar pipeline.
     """
-    logger.info("[bold blue]Starting Hermes AI Agent Cycle...[/bold blue]")
+    logger.info("[bold blue]Starting Hermes AI News Pipeline...[/bold blue]")
     
-    crawler = NewsCrawler()
-    db = NewsDatabase()
-    summarizer = ArticleSummarizer()
-    
+    # 1. Setup Database (Tier 3)
+    logger.info("Initializing Tier 3 (The Vault) Database...")
     try:
-        # Step 1: Crawling
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console
-        ) as progress:
-            progress.add_task(description="Fetching RSS feeds...", total=None)
-            articles = await crawler.crawl()
-        
-        logger.info(f"Discovered [bold]{len(articles)}[/bold] articles total.")
-        
-        new_articles_count = 0
-        filtered_count = 0
-
-        # Step 2-4: Process each article
-        for article in articles:
-            # --- STAGE 1: Pre-LLM Signal Filter ---
-            # Use title + first 500 chars of raw_text as the scoring corpus
-            description_snippet = article.raw_text[:500] if article.raw_text else ""
-            if not should_process(article.title, description_snippet):
-                filtered_count += 1
-                continue
-
-            # --- STAGE 2: Deduplication ---
-            if await db.article_exists(article.source_url):
-                logger.debug(f"Skipping existing article: {article.title}")
-                continue
-
-            logger.info(f"[yellow]Processing new article:[/yellow] {article.title}")
-
-            try:
-                # Tech Radar analysis — returns a validated structured dict
-                analysis_dict = summarizer.process_article(article.raw_text)
-
-                # Validate the required fields are present before persisting
-                if not analysis_dict.get('tl_dr') or not analysis_dict.get('category'):
-                    logger.warning(f"[yellow]Analysis incomplete or missing fields for:[/yellow] {article.title}")
-                    continue
-
-                # Hydrate the structured Pydantic model from the LLM dict
-                article.analysis = TechRadarAnalysis(**analysis_dict)
-
-                # Final storage - ONLY if analysis was successfully structured
-                await db.save_article(article)
-                new_articles_count += 1
-                logger.info(
-                    f"[green]Saved:[/green] [{article.analysis.category}] "
-                    f"(score: {article.analysis.relevance_score}) {article.title}"
-                )
-
-            except json.JSONDecodeError:
-                logger.error(f"[red]LLM returned invalid JSON for:[/red] '{article.title}' — skipping.")
-                continue
-            except Exception as e:
-                logger.error(f"[red]Failed to process article '{article.title}': {e}[/red]")
-                continue
-
-            # --- STAGE 3: Rate Limit Guard ---
-            # Sleep 12s between API calls to respect the Free Tier limit (~5 RPM).
-            # Only executed after a successful LLM call, not on skipped/failed articles.
-            logger.debug("Rate limit guard: sleeping 12s before next API call...")
-            await asyncio.sleep(12)
-
-        logger.info(
-            f"[bold green]Cycle Complete.[/bold green] "
-            f"Saved={new_articles_count} | Filtered={filtered_count}"
-        )
-        
+        setup_database()
     except Exception as e:
-        logger.error(f"Cycle failed with error: {e}")
-    finally:
-        await db.close()
+        logger.error(f"Critical Database Setup Error: {e}. Exiting pipeline.")
+        return
 
-async def main():
-    """
-    Entry point for the Hermes AI News Agent.
-    Sets up scheduling and initiates the initial test run.
-    """
-    # 1. Run immediately once to verify everything is working
-    await run_agent_cycle()
+    # 2. Ingest Articles (Tier 1)
+    logger.info("Starting Tier 1 (Ingestor)...")
+    raw_articles = process_sources()
     
-    # 2. Setup APScheduler
-    scheduler = AsyncIOScheduler()
+    if not raw_articles:
+        logger.warning("No articles ingested. Exiting.")
+        return
+        
+    logger.info(f"Ingested {len(raw_articles)} articles.")
     
-    # Schedule: 08:00, 14:00, 20:00 Daily
-    scheduler.add_job(run_agent_cycle, 'cron', hour=8, minute=0)
-    scheduler.add_job(run_agent_cycle, 'cron', hour=14, minute=0)
-    scheduler.add_job(run_agent_cycle, 'cron', hour=20, minute=0)
-    
-    scheduler.start()
-    logger.info("Scheduler started. Jobs set for [bold]08:00, 14:00, 20:00[/bold] daily.")
-    
-    # 3. Continuous Execution
-    # Using an Event to keep the script alive headless on the Raspberry Pi
-    stop_event = asyncio.Event()
-    try:
-        await stop_event.wait()
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Shutting down agent...")
+    success_count = 0
+    failure_count = 0
+
+    # 3. Process & Save Each Article
+    for i, article in enumerate(raw_articles, 1):
+        title = article.get("title", "Untitled")
+        logger.info(f"[yellow]Processing ({i}/{len(raw_articles)}):[/yellow] {title}")
+        
+        # Extract markdown content
+        markdown_content = article.get("raw_markdown_content")
+        if not markdown_content:
+            logger.warning(f"No markdown content for '{title}'. Skipping.")
+            failure_count += 1
+            continue
+
+        # Run Tier 2 Analysis
+        logger.debug(f"Analyzing '{title}' via Tier 2 Intelligence Engine...")
+        intelligence = analyze_article(markdown_content)
+        
+        if intelligence:
+            # Attach intelligence to the article dict
+            article["intelligence"] = intelligence
+            
+            # Convert published_date string to a datetime object for MongoDB TTL index
+            date_str = article.get("published_date")
+            if date_str:
+                try:
+                    # Clean the ISO string if it ends with 'Z'
+                    if date_str.endswith('Z'):
+                        date_str = date_str[:-1] + '+00:00'
+                    article["published_date"] = datetime.fromisoformat(date_str)
+                except Exception as e:
+                    logger.warning(f"Failed to parse date '{date_str}': {e}. Using current UTC time.")
+                    article["published_date"] = datetime.utcnow()
+            else:
+                article["published_date"] = datetime.utcnow()
+            
+            # Save to MongoDB
+            if save_article(article):
+                success_count += 1
+                logger.info(f"[green]Saved successfully:[/green] {title}")
+            else:
+                failure_count += 1
+                logger.error(f"[red]Failed to save:[/red] {title}")
+        else:
+            failure_count += 1
+            logger.error(f"[red]Analysis failed for:[/red] {title}. Skipping save.")
+
+    logger.info(
+        f"[bold green]Pipeline Complete![/bold green] "
+        f"Saved: {success_count} | Failed/Skipped: {failure_count}"
+    )
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        run_pipeline()
     except KeyboardInterrupt:
-        pass
+        logger.info("Pipeline interrupted by user.")
